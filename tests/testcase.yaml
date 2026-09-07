@@ -1,0 +1,11 @@
+common:
+  harness: ztest
+  tags:
+    - lib
+    - sep3
+    - uart
+  platform_allow:
+    - native_sim/native/64
+
+tests:
+  lib.sep3_zephyr.uart_emul: {}

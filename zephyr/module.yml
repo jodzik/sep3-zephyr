@@ -1,0 +1,4 @@
+name: sep3-zephyr
+build:
+  cmake: .
+  kconfig: Kconfig

@@ -1,0 +1,49 @@
+menuconfig SEP3_ZEPHYR
+    bool "SEP3 blocking wrapper for Zephyr async UART"
+    default n
+    depends on SERIAL
+    depends on UART_ASYNC_API
+
+if SEP3_ZEPHYR
+
+config SEP3_ZEPHYR_MAX_INSTANCES
+    int "Maximum simultaneous wrapper instances"
+    range 1 16
+    default 4
+
+config SEP3_ZEPHYR_ENDPOINT_CAPACITY
+    int "Maximum endpoint count per instance"
+    range 1 240
+    default 16
+
+config SEP3_ZEPHYR_THREAD_STACK_SIZE
+    int "Owner thread stack size"
+    range 1024 65535
+    default 4096
+
+config SEP3_ZEPHYR_THREAD_PRIORITY
+    int "Owner thread priority"
+    range 0 15
+    default 5
+
+config SEP3_ZEPHYR_COMMAND_QUEUE_SIZE
+    int "Pending command queue size"
+    range 2 64
+    default 8
+
+config SEP3_ZEPHYR_RX_RING_SIZE
+    int "Received byte ring size"
+    range 288 8192
+    default 1024
+
+config SEP3_ZEPHYR_RX_BUFFER_SIZE
+    int "UART DMA receive buffer size"
+    range 64 4096
+    default 288
+
+config SEP3_ZEPHYR_PROCESS_PERIOD_MS
+    int "Maximum protocol processing period"
+    range 1 1000
+    default 10
+
+endif

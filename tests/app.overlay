@@ -1,0 +1,17 @@
+/ {
+    sep3_uart_a: sep3-uart-a {
+        compatible = "zephyr,uart-emul";
+        status = "okay";
+        current-speed = <115200>;
+        rx-fifo-size = <1024>;
+        tx-fifo-size = <1024>;
+    };
+
+    sep3_uart_b: sep3-uart-b {
+        compatible = "zephyr,uart-emul";
+        status = "okay";
+        current-speed = <115200>;
+        rx-fifo-size = <1024>;
+        tx-fifo-size = <1024>;
+    };
+};

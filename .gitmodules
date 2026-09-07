@@ -1,0 +1,3 @@
+[submodule "sep3-c"]
+	path = sep3-c
+	url = git@github.com:jodzik/sep3-c.git
