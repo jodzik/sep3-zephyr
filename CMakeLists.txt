@@ -11,5 +11,6 @@ if(CONFIG_SEP3_ZEPHYR)
         sep3-c
         ${CMAKE_CURRENT_SOURCE_DIR}/../safe-c
         ${CMAKE_CURRENT_SOURCE_DIR}/../framer7b-c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../crc-c
     )
 endif()

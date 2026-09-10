@@ -15,6 +15,7 @@ target_sources(app PRIVATE
 target_include_directories(app PRIVATE
     ${SEP3_ZEPHYR_ROOT}/../safe-c
     ${SEP3_ZEPHYR_ROOT}/../framer7b-c
+    ${SEP3_ZEPHYR_ROOT}/../crc-c
 )
 
 target_compile_options(app PRIVATE -Werror -Wno-attributes)

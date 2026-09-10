@@ -12,11 +12,14 @@
 
 LOG_MODULE_REGISTER(sep3_zephyr);
 
+BUILD_ASSERT(CONFIG_SEP3_ZEPHYR_RX_RING_SIZE >= SEP3_MAX_ENCODED_FRAME_SIZE,
+    "CONFIG_SEP3_ZEPHYR_RX_RING_SIZE must hold one encoded SEP3 frame");
+
 enum Sep3ZephyrState {
     SEP3_ZEPHYR_STATE_UNINITIALIZED = 0,
+    SEP3_ZEPHYR_STATE_INITIALIZING,
     SEP3_ZEPHYR_STATE_RUNNING,
-    SEP3_ZEPHYR_STATE_STOPPING,
-    SEP3_ZEPHYR_STATE_STOPPED,
+    SEP3_ZEPHYR_STATE_FAILED,
 };
 
 enum Sep3ZephyrTxEvent {
@@ -34,38 +37,38 @@ enum Sep3ZephyrCommandType {
     SEP3_ZEPHYR_COMMAND_SEND_READ_ANSWER,
     SEP3_ZEPHYR_COMMAND_SEND_WRITE_ANSWER,
     SEP3_ZEPHYR_COMMAND_SEND_ERROR_ANSWER,
-    SEP3_ZEPHYR_COMMAND_STOP,
 };
 
 struct Sep3ZephyrCommand {
     enum Sep3ZephyrCommandType type;
-    struct Sep3Zephyr *owner;
     struct k_sem completed;
     int result;
     union {
         struct {
             DataId data_id;
+            uint32_t incoming_request_timeout_ms;
             Sep3ZephyrReadHandler handler;
             void *user;
         } register_read;
         struct {
             DataId data_id;
+            uint32_t incoming_request_timeout_ms;
             bool allow_write_no_answer;
             Sep3ZephyrWriteHandler handler;
             void *user;
         } register_write;
         struct {
             DataId data_id;
+            uint32_t timeout_ms;
             uint8_t *data;
             uint16_t data_capacity;
             uint16_t *data_size;
-            struct Sep3ZephyrRequestResult *result;
         } read;
         struct {
             DataId data_id;
+            uint32_t timeout_ms;
             uint8_t const *data;
             uint16_t data_size;
-            struct Sep3ZephyrRequestResult *result;
         } write;
         struct {
             DataId data_id;
@@ -93,11 +96,8 @@ static struct device const *g_claimed_uarts[CONFIG_SEP3_ZEPHYR_MAX_INSTANCES];
 K_MUTEX_DEFINE(g_init_mutex);
 
 static int _enter_api(struct Sep3Zephyr *self);
-static void _leave_api(struct Sep3Zephyr *self);
 static int _submit_command(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *command);
-static int _queue_stop_command(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *command);
 static void _uart_callback(struct device const *device, struct uart_event *event, void *user_data);
-static void _uart_noop_callback(struct device const *device, struct uart_event *event, void *user_data);
 static void _thread_entry(void *arg1, void *arg2, void *arg3);
 
 static uint32_t _next_token_epoch(void)
@@ -111,7 +111,7 @@ static uint32_t _next_token_epoch(void)
     return epoch;
 }
 
-static int _claim_uart(struct Sep3Zephyr *self, struct device const *uart)
+static int _claim_uart(struct device const *uart)
 {
     int rc = ER_NO_MEM;
 
@@ -122,7 +122,6 @@ static int _claim_uart(struct Sep3Zephyr *self, struct device const *uart)
     for (uint8_t i = 0; i < ARRAY_SIZE(g_claimed_uarts); i++) {
         if (NULL == g_claimed_uarts[i]) {
             g_claimed_uarts[i] = uart;
-            self->uart_claim_index = (int8_t)i;
             rc = 0;
             break;
         }
@@ -133,38 +132,15 @@ finally:
     return rc;
 }
 
-static void _release_uart(struct Sep3Zephyr *self)
-{
-    if (0 <= self->uart_claim_index && (size_t)self->uart_claim_index < ARRAY_SIZE(g_claimed_uarts)) {
-        g_claimed_uarts[self->uart_claim_index] = NULL;
-        self->uart_claim_index = -1;
-    }
-}
-
 static int _enter_api(struct Sep3Zephyr *self)
 {
     int rc = 0;
-    bool is_locked = false;
 
-    TRY(k_mutex_lock(&g_init_mutex, K_FOREVER));
-    is_locked = true;
     ASSERT(SEP3_ZEPHYR_STATE_RUNNING == atomic_get(&self->state), ER_NO_DEV);
-    atomic_inc(&self->active_call_count);
 
 finally:
 
-    if (is_locked) {
-        k_mutex_unlock(&g_init_mutex);
-    }
-
     return rc;
-}
-
-static void _leave_api(struct Sep3Zephyr *self)
-{
-    if (1 == atomic_dec(&self->active_call_count)) {
-        k_sem_give(&self->active_calls_done);
-    }
 }
 
 static struct Sep3ZephyrEndpoint *_find_endpoint(struct Sep3Zephyr *self, DataId const data_id)
@@ -192,7 +168,6 @@ static struct Sep3ZephyrEndpoint *_allocate_endpoint(struct Sep3Zephyr *self, Da
             endpoint->owner = self;
             endpoint->data_id = data_id;
             endpoint->is_used = true;
-            self->endpoint_count++;
             return endpoint;
         }
     }
@@ -200,11 +175,10 @@ static struct Sep3ZephyrEndpoint *_allocate_endpoint(struct Sep3Zephyr *self, Da
     return NULL;
 }
 
-static void _release_empty_endpoint(struct Sep3Zephyr *self, struct Sep3ZephyrEndpoint *endpoint)
+static void _release_empty_endpoint(struct Sep3ZephyrEndpoint *endpoint)
 {
     if (NULL == endpoint->on_read && NULL == endpoint->on_write) {
         memset(endpoint, 0, sizeof(*endpoint));
-        self->endpoint_count--;
     }
 }
 
@@ -245,33 +219,37 @@ static void _request_callback(
     void *user)
 {
     struct Sep3ZephyrCommand *command = user;
-    struct Sep3ZephyrRequestResult *result = NULL;
     uint8_t *data = NULL;
     uint16_t data_capacity = 0;
     uint16_t *data_size = NULL;
+    enum Sep3PacketType expected_type = SEP3_PACKET_READ_ANSWER;
     int rc = core_result->result;
 
     ARG_UNUSED(core);
 
     if (SEP3_ZEPHYR_COMMAND_READ == command->type) {
-        result = command->args.read.result;
         data = command->args.read.data;
         data_capacity = command->args.read.data_capacity;
         data_size = command->args.read.data_size;
     } else {
-        result = command->args.write.result;
+        expected_type = SEP3_PACKET_WRITE_ANSWER;
     }
 
-    result->answer_type = core_result->answer_type;
-    result->remote_error_code = core_result->remote_error_code;
-    result->data_size = core_result->data_size;
-
-    if (NULL != core_result->remote_error_message) {
-        (void)strlcpy(result->remote_error_message, core_result->remote_error_message,
-            sizeof(result->remote_error_message));
+    if (0 == rc && expected_type != core_result->answer_type) {
+        if (SEP3_PACKET_APP_ERROR_ANSWER == core_result->answer_type) {
+            LOG_ERR("SEP3 application error: code=0x%02x message='%s'", core_result->remote_error_code,
+                NULL != core_result->remote_error_message ? core_result->remote_error_message : "");
+            rc = ER_PROTO_INTERNAL;
+        } else if (SEP3_PACKET_PROTO_ERROR_ANSWER == core_result->answer_type) {
+            LOG_ERR("SEP3 protocol error: code=0x%02x", core_result->remote_error_code);
+            rc = ER_PROTO;
+        } else {
+            LOG_ERR("Unexpected SEP3 answer type: 0x%02x", core_result->answer_type);
+            rc = ER_PROTO;
+        }
     }
 
-    if (NULL != data_size) {
+    if (0 == rc && NULL != data_size) {
         *data_size = core_result->data_size;
     }
 
@@ -307,7 +285,7 @@ static int _transmit(
     atomic_set(&self->tx_abort_requested, 0);
     atomic_set(&self->tx_active, 1);
 
-    uart_rc = uart_tx(self->config.uart, frame, frame_size, (int32_t)self->config.uart_tx_timeout_us);
+    uart_rc = uart_tx(self->uart, frame, frame_size, (int32_t)self->uart_tx_timeout_us);
     if (0 != uart_rc) {
         atomic_set(&self->tx_active, 0);
         rc = -EBUSY == uart_rc ? ER_AGAIN : ER_IO;
@@ -325,7 +303,7 @@ static int _register_read(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *com
 
     ASSERT(NULL != endpoint, ER_NO_MEM);
     TRY(sep3__register_read_handler(&self->core, command->args.register_read.data_id,
-        _read_endpoint_adapter, endpoint));
+        command->args.register_read.incoming_request_timeout_ms, _read_endpoint_adapter, endpoint));
 
     endpoint->on_read = command->args.register_read.handler;
     endpoint->on_read_user = command->args.register_read.user;
@@ -333,7 +311,7 @@ static int _register_read(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *com
 finally:
 
     if (0 != rc && NULL != endpoint) {
-        _release_empty_endpoint(self, endpoint);
+        _release_empty_endpoint(endpoint);
     }
 
     return rc;
@@ -346,6 +324,7 @@ static int _register_write(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *co
 
     ASSERT(NULL != endpoint, ER_NO_MEM);
     TRY(sep3__register_write_handler(&self->core, command->args.register_write.data_id,
+        command->args.register_write.incoming_request_timeout_ms,
         command->args.register_write.allow_write_no_answer, _write_endpoint_adapter, endpoint));
 
     endpoint->on_write = command->args.register_write.handler;
@@ -354,7 +333,7 @@ static int _register_write(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *co
 finally:
 
     if (0 != rc && NULL != endpoint) {
-        _release_empty_endpoint(self, endpoint);
+        _release_empty_endpoint(endpoint);
     }
 
     return rc;
@@ -364,7 +343,8 @@ static int _start_read(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *comman
 {
     int rc = 0;
 
-    TRY(sep3__read(&self->core, command->args.read.data_id, _request_callback, command));
+    TRY(sep3__read(&self->core, command->args.read.data_id, command->args.read.timeout_ms,
+        _request_callback, command));
 
 finally:
 
@@ -375,8 +355,8 @@ static int _start_write(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *comma
 {
     int rc = 0;
 
-    TRY(sep3__write(&self->core, command->args.write.data_id, command->args.write.data,
-        command->args.write.data_size, _request_callback, command));
+    TRY(sep3__write(&self->core, command->args.write.data_id, command->args.write.timeout_ms,
+        command->args.write.data, command->args.write.data_size, _request_callback, command));
 
 finally:
 
@@ -418,29 +398,6 @@ static void _handle_command(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *c
             rc = sep3__send_error_answer(&self->core, &command->args.error_answer.token,
                 command->args.error_answer.error_code, command->args.error_answer.message);
             break;
-        case SEP3_ZEPHYR_COMMAND_STOP:
-            if (self->core.outgoing.active || self->core.incoming.active || self->core.incoming.answer_pending ||
-                self->core.transient_answer_pending || 0U != self->core.tx_count ||
-                0 != atomic_get(&self->tx_active)) {
-                rc = ER_BUSY;
-                atomic_set(&self->state, SEP3_ZEPHYR_STATE_RUNNING);
-            } else {
-                self->stop_command = command;
-                if (0 != atomic_get(&self->rx_disabled)) {
-                    complete_now = false;
-                } else {
-                    rc = uart_rx_disable(self->config.uart);
-                    if (-EFAULT == rc) {
-                        atomic_set(&self->rx_disabled, 1);
-                        rc = 0;
-                    } else if (0 != rc) {
-                        self->stop_command = NULL;
-                        atomic_set(&self->state, SEP3_ZEPHYR_STATE_RUNNING);
-                    }
-                    complete_now = 0 != rc;
-                }
-            }
-            break;
         default:
             rc = ER_INVAL;
             break;
@@ -481,11 +438,6 @@ static void _handle_received(struct Sep3Zephyr *self)
         LOG_WRN("UART RX data was lost; waiting for the next valid SEP3 frame");
     }
 
-    if (SEP3_ZEPHYR_STATE_STOPPING == atomic_get(&self->state)) {
-        ring_buf_reset(&self->rx_ring);
-        return;
-    }
-
     do {
         size = ring_buf_get_claim(&self->rx_ring, &data, UINT16_MAX);
         if (0U < size) {
@@ -504,7 +456,7 @@ static void _check_tx_watchdog(struct Sep3Zephyr *self)
         return;
     }
 
-    int64_t const timeout_ms = DIV_ROUND_UP((int64_t)self->config.uart_tx_timeout_us, USEC_PER_MSEC);
+    int64_t const timeout_ms = DIV_ROUND_UP((int64_t)self->uart_tx_timeout_us, USEC_PER_MSEC);
     if (k_uptime_get() - self->tx_started_ms < timeout_ms) {
         return;
     }
@@ -513,7 +465,7 @@ static void _check_tx_watchdog(struct Sep3Zephyr *self)
         return;
     }
 
-    int const rc = uart_tx_abort(self->config.uart);
+    int const rc = uart_tx_abort(self->uart);
     if (0 != rc && -EFAULT != rc) {
         atomic_set(&self->tx_abort_requested, 0);
         LOG_ERR("Failed to abort timed out UART TX: %d", rc);
@@ -528,8 +480,8 @@ static void _restart_rx(struct Sep3Zephyr *self)
 
     for (uint8_t i = 0; i < ARRAY_SIZE(self->rx_buffers); i++) {
         if (atomic_cas(&self->rx_buffer_owned[i], 0, 1)) {
-            int const rc = uart_rx_enable(self->config.uart, self->rx_buffers[i], sizeof(self->rx_buffers[i]),
-                (int32_t)self->config.uart_rx_timeout_us);
+            int const rc = uart_rx_enable(self->uart, self->rx_buffers[i], sizeof(self->rx_buffers[i]),
+                (int32_t)self->uart_rx_timeout_us);
             if (0 == rc) {
                 atomic_set(&self->rx_disabled, 0);
             } else {
@@ -539,22 +491,6 @@ static void _restart_rx(struct Sep3Zephyr *self)
             return;
         }
     }
-}
-
-static bool _finish_stop_if_ready(struct Sep3Zephyr *self)
-{
-    if (SEP3_ZEPHYR_STATE_STOPPING != atomic_get(&self->state) || 0 == atomic_get(&self->rx_disabled)) {
-        return false;
-    }
-
-    ring_buf_reset(&self->rx_ring);
-    int const rc = uart_callback_set(self->config.uart, _uart_noop_callback, NULL);
-
-    struct Sep3ZephyrCommand *command = self->stop_command;
-    self->stop_command = NULL;
-    _complete_command(command, 0 == rc ? 0 : ER_IO);
-
-    return true;
 }
 
 static void _thread_entry(void *arg1, void *arg2, void *arg3)
@@ -578,9 +514,6 @@ static void _thread_entry(void *arg1, void *arg2, void *arg3)
         struct Sep3ZephyrCommand *command = NULL;
         while (0 == k_msgq_get(&self->command_queue, &command, K_NO_WAIT)) {
             _handle_command(self, command);
-            if (SEP3_ZEPHYR_STATE_STOPPING == atomic_get(&self->state)) {
-                break;
-            }
         }
 
         int64_t const now_ms = k_uptime_get();
@@ -592,9 +525,6 @@ static void _thread_entry(void *arg1, void *arg2, void *arg3)
         }
 
         _restart_rx(self);
-        if (_finish_stop_if_ready(self)) {
-            return;
-        }
     }
 }
 
@@ -613,7 +543,7 @@ static void _provide_rx_buffer(struct Sep3Zephyr *self)
 {
     for (uint8_t i = 0; i < ARRAY_SIZE(self->rx_buffers); i++) {
         if (atomic_cas(&self->rx_buffer_owned[i], 0, 1)) {
-            int const rc = uart_rx_buf_rsp(self->config.uart, self->rx_buffers[i], sizeof(self->rx_buffers[i]));
+            int const rc = uart_rx_buf_rsp(self->uart, self->rx_buffers[i], sizeof(self->rx_buffers[i]));
             if (0 != rc) {
                 atomic_set(&self->rx_buffer_owned[i], 0);
                 atomic_set(&self->rx_error, 1);
@@ -675,18 +605,10 @@ static void _uart_callback(struct device const *device, struct uart_event *event
     k_sem_give(&self->event_sem);
 }
 
-static void _uart_noop_callback(struct device const *device, struct uart_event *event, void *user_data)
-{
-    ARG_UNUSED(device);
-    ARG_UNUSED(event);
-    ARG_UNUSED(user_data);
-}
-
 static int _submit_command(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *command)
 {
     int rc = 0;
     bool is_locked = false;
-    bool is_enqueued = false;
 
     ASSERT(NULL != self, ER_INVAL);
     ASSERT(NULL != command, ER_INVAL);
@@ -697,114 +619,103 @@ static int _submit_command(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *co
     ASSERT(SEP3_ZEPHYR_STATE_RUNNING == atomic_get(&self->state), ER_NO_DEV);
 
     k_sem_init(&command->completed, 0, 1);
-    command->owner = self;
     command->result = 0;
     rc = k_msgq_put(&self->command_queue, &command, K_NO_WAIT);
     ASSERT(0 == rc, ER_AGAIN);
-    atomic_inc(&self->command_count);
-    is_enqueued = true;
     k_mutex_unlock(&self->command_mutex);
     is_locked = false;
     k_sem_give(&self->event_sem);
     TRY(k_sem_take(&command->completed, K_FOREVER));
     rc = command->result;
-    atomic_dec(&self->command_count);
-    is_enqueued = false;
 
 finally:
 
     if (is_locked) {
         k_mutex_unlock(&self->command_mutex);
-    }
-    if (is_enqueued) {
-        atomic_dec(&self->command_count);
     }
 
     return rc;
 }
 
-static int _queue_stop_command(struct Sep3Zephyr *self, struct Sep3ZephyrCommand *command)
+static int __noinline _submit_read_answer_command(
+    struct Sep3Zephyr *self,
+    struct Sep3RequestToken const *token,
+    uint8_t const *data,
+    uint16_t const data_size)
 {
-    int rc = 0;
-    bool is_locked = false;
+    struct Sep3ZephyrCommand command = {
+        .type = SEP3_ZEPHYR_COMMAND_SEND_READ_ANSWER,
+        .args.read_answer = {.token = *token, .data = data, .data_size = data_size},
+    };
 
-    ASSERT(NULL != self, ER_INVAL);
-    ASSERT(NULL != command, ER_INVAL);
+    return _submit_command(self, &command);
+}
 
-    TRY(k_mutex_lock(&self->command_mutex, K_FOREVER));
-    is_locked = true;
-    ASSERT(SEP3_ZEPHYR_STATE_RUNNING == atomic_get(&self->state), ER_BUSY);
-    ASSERT(0 == atomic_get(&self->command_count), ER_BUSY);
+static int __noinline _submit_write_answer_command(
+    struct Sep3Zephyr *self,
+    struct Sep3RequestToken const *token)
+{
+    struct Sep3ZephyrCommand command = {
+        .type = SEP3_ZEPHYR_COMMAND_SEND_WRITE_ANSWER,
+        .args.write_answer = {.token = *token},
+    };
 
-    atomic_set(&self->state, SEP3_ZEPHYR_STATE_STOPPING);
-    k_sem_init(&command->completed, 0, 1);
-    command->owner = self;
-    command->result = 0;
-    rc = k_msgq_put(&self->command_queue, &command, K_NO_WAIT);
-    if (0 != rc) {
-        atomic_set(&self->state, SEP3_ZEPHYR_STATE_RUNNING);
-        rc = ER_AGAIN;
-        goto finally;
-    }
+    return _submit_command(self, &command);
+}
 
-    k_mutex_unlock(&self->command_mutex);
-    is_locked = false;
-    k_sem_give(&self->event_sem);
+static int __noinline _submit_error_answer_command(
+    struct Sep3Zephyr *self,
+    struct Sep3RequestToken const *token,
+    uint8_t const error_code,
+    char const *const message)
+{
+    struct Sep3ZephyrCommand command = {
+        .type = SEP3_ZEPHYR_COMMAND_SEND_ERROR_ANSWER,
+        .args.error_answer = {.token = *token, .error_code = error_code, .message = message},
+    };
 
-finally:
-
-    if (is_locked) {
-        k_mutex_unlock(&self->command_mutex);
-    }
-
-    return rc;
+    return _submit_command(self, &command);
 }
 
 int sep3_zephyr_init(struct Sep3Zephyr *self, struct Sep3ZephyrConfig const *config)
 {
     int rc = 0;
     struct Sep3Config core_config = {0};
-    bool callback_set = false;
-    bool rx_enabled = false;
-    bool thread_created = false;
+    struct uart_driver_api const *uart_api = NULL;
+    bool initialization_started = false;
     bool init_locked = false;
-    bool uart_claimed = false;
 
     ASSERT(NULL != self, ER_INVAL);
     ASSERT(NULL != config, ER_INVAL);
     ASSERT(!k_is_in_isr(), ER_NOT_PERM);
     ASSERT(NULL != config->uart, ER_INVAL);
     ASSERT(device_is_ready(config->uart), ER_NO_DEV);
-    ASSERT(0U < config->request_timeout_ms, ER_INVAL);
-    ASSERT(0U < config->incoming_request_timeout_ms, ER_INVAL);
+    ASSERT(DEVICE_API_IS(uart, config->uart), ER_INVAL);
     ASSERT(0U < config->uart_rx_timeout_us && config->uart_rx_timeout_us <= INT32_MAX, ER_INVAL);
     ASSERT(0U < config->uart_tx_timeout_us && config->uart_tx_timeout_us <= INT32_MAX, ER_INVAL);
+    uart_api = DEVICE_API_GET(uart, config->uart);
+    ASSERT(NULL != uart_api->tx_abort, ER_NOT_SUPPORTED);
     TRY(k_mutex_lock(&g_init_mutex, K_FOREVER));
     init_locked = true;
-    ASSERT(SEP3_ZEPHYR_STATE_UNINITIALIZED == atomic_get(&self->state) ||
-        SEP3_ZEPHYR_STATE_STOPPED == atomic_get(&self->state), ER_ALREADY);
+    ASSERT(SEP3_ZEPHYR_STATE_UNINITIALIZED == atomic_get(&self->state), ER_ALREADY);
 
     memset(self, 0, sizeof(*self));
-    self->uart_claim_index = -1;
-    self->config = *config;
+    atomic_set(&self->state, SEP3_ZEPHYR_STATE_INITIALIZING);
+    initialization_started = true;
+    self->uart = config->uart;
+    self->uart_rx_timeout_us = config->uart_rx_timeout_us;
+    self->uart_tx_timeout_us = config->uart_tx_timeout_us;
     k_sem_init(&self->event_sem, 0, K_SEM_MAX_LIMIT);
-    k_sem_init(&self->active_calls_done, 0, 1);
     k_mutex_init(&self->command_mutex);
     k_mutex_init(&self->request_mutex);
     k_msgq_init(&self->command_queue, (char *)self->command_queue_buffer,
         sizeof(self->command_queue_buffer[0]), ARRAY_SIZE(self->command_queue_buffer));
     ring_buf_init(&self->rx_ring, sizeof(self->rx_ring_buffer), self->rx_ring_buffer);
-    TRY(_claim_uart(self, config->uart));
-    uart_claimed = true;
-
-    struct uart_driver_api const *uart_api = config->uart->api;
-    ASSERT(NULL != uart_api->tx_abort, ER_NOT_SUPPORTED);
+    TRY(_claim_uart(config->uart));
 
     core_config.buffers = &self->buffers;
     core_config.endpoints = self->core_endpoints;
     core_config.endpoint_capacity = ARRAY_SIZE(self->core_endpoints);
-    core_config.request_timeout_ms = config->request_timeout_ms;
-    core_config.incoming_request_timeout_ms = config->incoming_request_timeout_ms;
     core_config.token_epoch = _next_token_epoch();
     core_config.retry_count = config->retry_count;
     core_config.transmit = _transmit;
@@ -815,17 +726,9 @@ int sep3_zephyr_init(struct Sep3Zephyr *self, struct Sep3ZephyrConfig const *con
         K_KERNEL_STACK_SIZEOF(self->thread_stack), _thread_entry, self, NULL, NULL,
         K_PRIO_PREEMPT(CONFIG_SEP3_ZEPHYR_THREAD_PRIORITY), 0, K_FOREVER);
     ASSERT(NULL != self->thread_id, ER_NO_MEM);
-    thread_created = true;
 
     TRY(uart_callback_set(config->uart, _uart_callback, self));
-    callback_set = true;
 
-    atomic_set(&self->rx_buffer_owned[0], 1);
-    TRY(uart_rx_enable(config->uart, self->rx_buffers[0], sizeof(self->rx_buffers[0]),
-        (int32_t)config->uart_rx_timeout_us));
-    rx_enabled = true;
-
-    atomic_set(&self->state, SEP3_ZEPHYR_STATE_RUNNING);
     if (NULL != config->thread_name) {
         int const name_rc = k_thread_name_set(self->thread_id, config->thread_name);
         if (0 != name_rc) {
@@ -834,74 +737,18 @@ int sep3_zephyr_init(struct Sep3Zephyr *self, struct Sep3ZephyrConfig const *con
     }
     k_thread_start(self->thread_id);
 
-finally:
+    atomic_set(&self->rx_buffer_owned[0], 1);
+    TRY(uart_rx_enable(config->uart, self->rx_buffers[0], sizeof(self->rx_buffers[0]),
+        (int32_t)config->uart_rx_timeout_us));
 
-    if (0 != rc) {
-        if (rx_enabled) {
-            (void)uart_rx_disable(config->uart);
-        }
-        if (callback_set) {
-            (void)uart_callback_set(config->uart, _uart_noop_callback, NULL);
-        }
-        if (thread_created) {
-            k_thread_abort(self->thread_id);
-            (void)k_thread_join(self->thread_id, K_FOREVER);
-        }
-        if (uart_claimed) {
-            _release_uart(self);
-        }
-        atomic_set(&self->state, SEP3_ZEPHYR_STATE_UNINITIALIZED);
-    }
-
-    if (init_locked) {
-        k_mutex_unlock(&g_init_mutex);
-    }
-
-    return rc;
-}
-
-int sep3_zephyr_deinit(struct Sep3Zephyr *self)
-{
-    int rc = 0;
-    int stop_rc = 0;
-    bool init_locked = false;
-    bool request_locked = false;
-    struct Sep3ZephyrCommand command = {.type = SEP3_ZEPHYR_COMMAND_STOP};
-
-    ASSERT(NULL != self, ER_INVAL);
-    ASSERT(!k_is_in_isr(), ER_NOT_PERM);
-    TRY(k_mutex_lock(&g_init_mutex, K_FOREVER));
-    init_locked = true;
-    ASSERT(SEP3_ZEPHYR_STATE_RUNNING == atomic_get(&self->state), ER_NO_DEV);
-    ASSERT(self->thread_id != k_current_get(), ER_BUSY);
-    rc = k_mutex_lock(&self->request_mutex, K_NO_WAIT);
-    ASSERT(0 == rc, ER_BUSY);
-    request_locked = true;
-    TRY(_queue_stop_command(self, &command));
-    k_mutex_unlock(&g_init_mutex);
-    init_locked = false;
-
-    TRY(k_sem_take(&command.completed, K_FOREVER));
-    stop_rc = command.result;
-    if (SEP3_ZEPHYR_STATE_STOPPING == atomic_get(&self->state)) {
-        TRY(k_thread_join(self->thread_id, K_FOREVER));
-        TRY(k_mutex_lock(&g_init_mutex, K_FOREVER));
-        init_locked = true;
-        _release_uart(self);
-        k_mutex_unlock(&self->request_mutex);
-        request_locked = false;
-        while (0 != atomic_get(&self->active_call_count)) {
-            TRY(k_sem_take(&self->active_calls_done, K_FOREVER));
-        }
-        atomic_set(&self->state, SEP3_ZEPHYR_STATE_STOPPED);
-    }
-    rc = stop_rc;
+    atomic_set(&self->state, SEP3_ZEPHYR_STATE_RUNNING);
 
 finally:
 
-    if (request_locked) {
-        k_mutex_unlock(&self->request_mutex);
+    if (0 != rc && initialization_started) {
+        atomic_set(&self->state, SEP3_ZEPHYR_STATE_FAILED);
     }
+
     if (init_locked) {
         k_mutex_unlock(&g_init_mutex);
     }
@@ -912,28 +759,29 @@ finally:
 int sep3_zephyr_register_read_handler(
     struct Sep3Zephyr *self,
     DataId const data_id,
+    uint32_t const incoming_request_timeout_ms,
     Sep3ZephyrReadHandler const handler,
     void *const user)
 {
     int rc = 0;
-    bool api_entered = false;
     struct Sep3ZephyrCommand command = {
         .type = SEP3_ZEPHYR_COMMAND_REGISTER_READ,
-        .args.register_read = {.data_id = data_id, .handler = handler, .user = user},
+        .args.register_read = {
+            .data_id = data_id,
+            .incoming_request_timeout_ms = incoming_request_timeout_ms,
+            .handler = handler,
+            .user = user,
+        },
     };
 
     ASSERT(NULL != self, ER_INVAL);
+    ASSERT(0U != incoming_request_timeout_ms, ER_INVAL);
     ASSERT(NULL != handler, ER_INVAL);
     TRY(_enter_api(self));
-    api_entered = true;
-    ASSERT(self->thread_id != k_current_get(), ER_BUSY);
+    ASSERT(self->thread_id != k_current_get(), ER_NOT_PERM);
     TRY(_submit_command(self, &command));
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }
@@ -941,16 +789,17 @@ finally:
 int sep3_zephyr_register_write_handler(
     struct Sep3Zephyr *self,
     DataId const data_id,
+    uint32_t const incoming_request_timeout_ms,
     bool const allow_write_no_answer,
     Sep3ZephyrWriteHandler const handler,
     void *const user)
 {
     int rc = 0;
-    bool api_entered = false;
     struct Sep3ZephyrCommand command = {
         .type = SEP3_ZEPHYR_COMMAND_REGISTER_WRITE,
         .args.register_write = {
             .data_id = data_id,
+            .incoming_request_timeout_ms = incoming_request_timeout_ms,
             .allow_write_no_answer = allow_write_no_answer,
             .handler = handler,
             .user = user,
@@ -958,17 +807,13 @@ int sep3_zephyr_register_write_handler(
     };
 
     ASSERT(NULL != self, ER_INVAL);
+    ASSERT(0U != incoming_request_timeout_ms, ER_INVAL);
     ASSERT(NULL != handler, ER_INVAL);
     TRY(_enter_api(self));
-    api_entered = true;
-    ASSERT(self->thread_id != k_current_get(), ER_BUSY);
+    ASSERT(self->thread_id != k_current_get(), ER_NOT_PERM);
     TRY(_submit_command(self, &command));
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }
@@ -976,34 +821,31 @@ finally:
 int sep3_zephyr_read(
     struct Sep3Zephyr *self,
     DataId const data_id,
+    uint32_t const timeout_ms,
     uint8_t *const data,
     uint16_t const data_capacity,
-    uint16_t *const data_size,
-    struct Sep3ZephyrRequestResult *const result)
+    uint16_t *const data_size)
 {
     int rc = 0;
-    bool api_entered = false;
     struct Sep3ZephyrCommand command = {
         .type = SEP3_ZEPHYR_COMMAND_READ,
         .args.read = {
             .data_id = data_id,
+            .timeout_ms = timeout_ms,
             .data = data,
             .data_capacity = data_capacity,
             .data_size = data_size,
-            .result = result,
         },
     };
 
     ASSERT(NULL != self, ER_INVAL);
+    ASSERT(0U != timeout_ms, ER_INVAL);
     ASSERT(NULL != data_size, ER_INVAL);
-    ASSERT(NULL != result, ER_INVAL);
     ASSERT(0U == data_capacity || NULL != data, ER_INVAL);
     ASSERT(!k_is_in_isr(), ER_NOT_PERM);
     TRY(_enter_api(self));
-    api_entered = true;
-    ASSERT(self->thread_id != k_current_get(), ER_BUSY);
+    ASSERT(self->thread_id != k_current_get(), ER_NOT_PERM);
 
-    memset(result, 0, sizeof(*result));
     *data_size = 0;
     TRY(k_mutex_lock(&self->request_mutex, K_FOREVER));
     rc = _submit_command(self, &command);
@@ -1011,45 +853,39 @@ int sep3_zephyr_read(
 
 finally:
 
-    if (api_entered) {
-        _leave_api(self);
-    }
-
     return rc;
 }
 
 int sep3_zephyr_write(
     struct Sep3Zephyr *self,
     DataId const data_id,
+    uint32_t const timeout_ms,
     uint8_t const *const data,
-    uint16_t const data_size,
-    struct Sep3ZephyrRequestResult *const result)
+    uint16_t const data_size)
 {
     int rc = 0;
-    bool api_entered = false;
     struct Sep3ZephyrCommand command = {
         .type = SEP3_ZEPHYR_COMMAND_WRITE,
-        .args.write = {.data_id = data_id, .data = data, .data_size = data_size, .result = result},
+        .args.write = {
+            .data_id = data_id,
+            .timeout_ms = timeout_ms,
+            .data = data,
+            .data_size = data_size,
+        },
     };
 
     ASSERT(NULL != self, ER_INVAL);
-    ASSERT(NULL != result, ER_INVAL);
+    ASSERT(0U != timeout_ms, ER_INVAL);
     ASSERT(0U == data_size || NULL != data, ER_INVAL);
     ASSERT(!k_is_in_isr(), ER_NOT_PERM);
     TRY(_enter_api(self));
-    api_entered = true;
-    ASSERT(self->thread_id != k_current_get(), ER_BUSY);
+    ASSERT(self->thread_id != k_current_get(), ER_NOT_PERM);
 
-    memset(result, 0, sizeof(*result));
     TRY(k_mutex_lock(&self->request_mutex, K_FOREVER));
     rc = _submit_command(self, &command);
     k_mutex_unlock(&self->request_mutex);
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }
@@ -1061,7 +897,6 @@ int sep3_zephyr_write_no_answer(
     uint16_t const data_size)
 {
     int rc = 0;
-    bool api_entered = false;
     struct Sep3ZephyrCommand command = {
         .type = SEP3_ZEPHYR_COMMAND_WRITE_NO_ANSWER,
         .args.write_no_answer = {.data_id = data_id, .data = data, .data_size = data_size},
@@ -1070,15 +905,10 @@ int sep3_zephyr_write_no_answer(
     ASSERT(NULL != self, ER_INVAL);
     ASSERT(0U == data_size || NULL != data, ER_INVAL);
     TRY(_enter_api(self));
-    api_entered = true;
-    ASSERT(self->thread_id != k_current_get(), ER_BUSY);
+    ASSERT(self->thread_id != k_current_get(), ER_NOT_PERM);
     TRY(_submit_command(self, &command));
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }
@@ -1090,30 +920,19 @@ int sep3_zephyr_send_read_answer(
     uint16_t const data_size)
 {
     int rc = 0;
-    bool api_entered = false;
-    struct Sep3ZephyrCommand command = {
-        .type = SEP3_ZEPHYR_COMMAND_SEND_READ_ANSWER,
-        .args.read_answer = {.data = data, .data_size = data_size},
-    };
 
     ASSERT(NULL != self, ER_INVAL);
     ASSERT(NULL != token, ER_INVAL);
     ASSERT(0U == data_size || NULL != data, ER_INVAL);
     TRY(_enter_api(self));
-    api_entered = true;
 
     if (self->thread_id == k_current_get()) {
         rc = sep3__send_read_answer(&self->core, token, data, data_size);
     } else {
-        command.args.read_answer.token = *token;
-        rc = _submit_command(self, &command);
+        rc = _submit_read_answer_command(self, token, data, data_size);
     }
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }
@@ -1123,26 +942,18 @@ int sep3_zephyr_send_write_answer(
     struct Sep3RequestToken const *const token)
 {
     int rc = 0;
-    bool api_entered = false;
-    struct Sep3ZephyrCommand command = {.type = SEP3_ZEPHYR_COMMAND_SEND_WRITE_ANSWER};
 
     ASSERT(NULL != self, ER_INVAL);
     ASSERT(NULL != token, ER_INVAL);
     TRY(_enter_api(self));
-    api_entered = true;
 
     if (self->thread_id == k_current_get()) {
         rc = sep3__send_write_answer(&self->core, token);
     } else {
-        command.args.write_answer.token = *token;
-        rc = _submit_command(self, &command);
+        rc = _submit_write_answer_command(self, token);
     }
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }
@@ -1154,29 +965,18 @@ int sep3_zephyr_send_error_answer(
     char const *const message)
 {
     int rc = 0;
-    bool api_entered = false;
-    struct Sep3ZephyrCommand command = {
-        .type = SEP3_ZEPHYR_COMMAND_SEND_ERROR_ANSWER,
-        .args.error_answer = {.error_code = error_code, .message = message},
-    };
 
     ASSERT(NULL != self, ER_INVAL);
     ASSERT(NULL != token, ER_INVAL);
     TRY(_enter_api(self));
-    api_entered = true;
 
     if (self->thread_id == k_current_get()) {
         rc = sep3__send_error_answer(&self->core, token, error_code, message);
     } else {
-        command.args.error_answer.token = *token;
-        rc = _submit_command(self, &command);
+        rc = _submit_error_answer_command(self, token, error_code, message);
     }
 
 finally:
-
-    if (api_entered) {
-        _leave_api(self);
-    }
 
     return rc;
 }

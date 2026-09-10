@@ -3,23 +3,37 @@ menuconfig SEP3_ZEPHYR
     default n
     depends on SERIAL
     depends on UART_ASYNC_API
+    select CRC
 
 if SEP3_ZEPHYR
 
 config SEP3_ZEPHYR_MAX_INSTANCES
-    int "Maximum simultaneous wrapper instances"
+    int "Maximum wrapper instances per boot"
     range 1 16
     default 4
+
+config SEP3_MAX_PAYLOAD_SIZE
+    int "Maximum SEP3 payload size"
+    range 64 2046
+    default 244
+    help
+      Maximum application payload accepted by sep3-c. Packet and encoded
+      frame sizes are derived from this value. Outside Zephyr the same value
+      must be provided as CONFIG_SEP3_MAX_PAYLOAD_SIZE by the build system.
 
 config SEP3_ZEPHYR_ENDPOINT_CAPACITY
     int "Maximum endpoint count per instance"
     range 1 240
-    default 16
+    default 8
 
 config SEP3_ZEPHYR_THREAD_STACK_SIZE
     int "Owner thread stack size"
     range 1024 65535
-    default 4096
+    default 2048
+    help
+      Large SEP3_MAX_PAYLOAD_SIZE can increase stack usage in application
+      callbacks. Raise this value when using payloads significantly larger
+      than 244 bytes.
 
 config SEP3_ZEPHYR_THREAD_PRIORITY
     int "Owner thread priority"
@@ -33,13 +47,17 @@ config SEP3_ZEPHYR_COMMAND_QUEUE_SIZE
 
 config SEP3_ZEPHYR_RX_RING_SIZE
     int "Received byte ring size"
-    range 288 8192
-    default 1024
+    range 290 8192
+    default 290
+    help
+      Must be at least SEP3_MAX_ENCODED_FRAME_SIZE derived from
+      SEP3_MAX_PAYLOAD_SIZE. The default holds one encoded packet with a
+      244-byte payload. Larger values reduce the risk of RX overrun.
 
 config SEP3_ZEPHYR_RX_BUFFER_SIZE
     int "UART DMA receive buffer size"
     range 64 4096
-    default 288
+    default 64
 
 config SEP3_ZEPHYR_PROCESS_PERIOD_MS
     int "Maximum protocol processing period"

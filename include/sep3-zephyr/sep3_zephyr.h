@@ -21,24 +21,9 @@ extern "C" {
 struct Sep3Zephyr;
 struct Sep3ZephyrCommand;
 
-/** Result of a completed confirmed request.
- *
- * A return value of zero from sep3_zephyr_read() or sep3_zephyr_write() means
- * that a valid SEP3 answer was received. Inspect answer_type to distinguish a
- * successful answer from a remote application or protocol error.
- */
-struct Sep3ZephyrRequestResult {
-    enum Sep3PacketType answer_type;
-    uint8_t remote_error_code;
-    uint16_t data_size;
-    char remote_error_message[SEP3_MAX_PAYLOAD_SIZE];
-};
-
 /** Wrapper configuration. */
 struct Sep3ZephyrConfig {
     struct device const *uart;
-    uint32_t request_timeout_ms;
-    uint32_t incoming_request_timeout_ms;
     uint32_t uart_rx_timeout_us;
     uint32_t uart_tx_timeout_us;
     uint8_t retry_count;
@@ -82,15 +67,19 @@ struct Sep3ZephyrEndpoint {
 
 /** SEP3 Zephyr instance.
  *
- * Allocate statically or zero-initialize before the first call to
- * sep3_zephyr_init(). Application code must not access the fields directly.
+ * Allocate statically or zero-initialize before the one allowed call to
+ * sep3_zephyr_init(). The instance and any resources acquired during
+ * initialization remain owned until reboot, including after an initialization
+ * failure. Application code must not access the fields directly.
  */
 struct Sep3Zephyr {
     struct Sep3 core;
     struct Sep3Buffers buffers;
     struct Sep3Endpoint core_endpoints[CONFIG_SEP3_ZEPHYR_ENDPOINT_CAPACITY];
     struct Sep3ZephyrEndpoint endpoints[CONFIG_SEP3_ZEPHYR_ENDPOINT_CAPACITY];
-    struct Sep3ZephyrConfig config;
+    struct device const *uart;
+    uint32_t uart_rx_timeout_us;
+    uint32_t uart_tx_timeout_us;
 
     struct k_thread thread;
     k_tid_t thread_id;
@@ -99,11 +88,8 @@ struct Sep3Zephyr {
     struct k_msgq command_queue;
     struct Sep3ZephyrCommand *command_queue_buffer[CONFIG_SEP3_ZEPHYR_COMMAND_QUEUE_SIZE];
     struct k_sem event_sem;
-    struct k_sem active_calls_done;
     struct k_mutex command_mutex;
     struct k_mutex request_mutex;
-    atomic_t command_count;
-    atomic_t active_call_count;
 
     struct ring_buf rx_ring;
     uint8_t rx_ring_buffer[CONFIG_SEP3_ZEPHYR_RX_RING_SIZE];
@@ -120,9 +106,6 @@ struct Sep3Zephyr {
     int64_t tx_started_ms;
 
     atomic_t state;
-    uint16_t endpoint_count;
-    int8_t uart_claim_index;
-    struct Sep3ZephyrCommand *stop_command;
 };
 
 /** Initialize and start an SEP3 instance on an async UART device.
@@ -131,50 +114,57 @@ struct Sep3Zephyr {
  * lifetime. The driver must implement uart_tx_abort() and emit exactly one
  * UART_TX_DONE or UART_TX_ABORTED event for every accepted transmission,
  * including after a successful abort.
+ *
+ * The function may be called only once per instance per boot. Validation
+ * failures before initialization starts leave the instance reusable. Any later
+ * failure leaves the instance and any acquired resources owned until reboot;
+ * the caller must enter its reboot flow.
  */
 int sep3_zephyr_init(struct Sep3Zephyr *self, struct Sep3ZephyrConfig const *config);
 
-/** Stop an idle instance.
- *
- * Returns ER_BUSY while a request or transport transmission is active.
- */
-int sep3_zephyr_deinit(struct Sep3Zephyr *self);
-
-/** Register a READ endpoint. Safe to call from any application thread. */
+/** Register a READ endpoint and its incoming response timeout. */
 int sep3_zephyr_register_read_handler(
     struct Sep3Zephyr *self,
     DataId data_id,
+    uint32_t incoming_request_timeout_ms,
     Sep3ZephyrReadHandler handler,
     void *user);
 
-/** Register a WRITE endpoint. Safe to call from any application thread. */
+/** Register a WRITE endpoint and its incoming response timeout. */
 int sep3_zephyr_register_write_handler(
     struct Sep3Zephyr *self,
     DataId data_id,
+    uint32_t incoming_request_timeout_ms,
     bool allow_write_no_answer,
     Sep3ZephyrWriteHandler handler,
     void *user);
 
-/** Perform a blocking READ transaction.
+/** Perform a blocking READ transaction with the local response timeout_ms.
  *
  * data_size receives the remote payload size. ER_OVERFLOW is returned without
- * copying a partial payload when data_capacity is too small.
+ * copying a partial payload when data_capacity is too small. A remote
+ * application error returns ER_PROTO_INTERNAL; a remote protocol error returns
+ * ER_PROTO.
  */
 int sep3_zephyr_read(
     struct Sep3Zephyr *self,
     DataId data_id,
+    uint32_t timeout_ms,
     uint8_t *data,
     uint16_t data_capacity,
-    uint16_t *data_size,
-    struct Sep3ZephyrRequestResult *result);
+    uint16_t *data_size);
 
-/** Perform a blocking WRITE transaction. */
+/** Perform a blocking WRITE transaction with the local response timeout_ms.
+ *
+ * A remote application error returns ER_PROTO_INTERNAL; a remote protocol
+ * error returns ER_PROTO.
+ */
 int sep3_zephyr_write(
     struct Sep3Zephyr *self,
     DataId data_id,
+    uint32_t timeout_ms,
     uint8_t const *data,
-    uint16_t data_size,
-    struct Sep3ZephyrRequestResult *result);
+    uint16_t data_size);
 
 /** Queue a best-effort WRITE_NO_ANSWER packet.
  *
